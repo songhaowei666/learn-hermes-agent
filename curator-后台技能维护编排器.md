@@ -1,0 +1,347 @@
+# Curator —— 后台技能维护编排器
+
+> 文件位置：`agent/curator.py`（约 2017 行）
+> 分析日期：2026-07-19
+
+---
+
+## 一、模块定位
+
+Curator 是 Hermes 的**后台技能自动维护系统**。它在 Agent 空闲时定期审查 agent 自己创建的技能，对技能做状态管理（active → stale → archived）和合并归纳（umbrella-building），保持技能库的整洁和可发现性。
+
+一句话概括：**自动管家，定期打扫技能库，不删东西只归档，默认不花钱。**
+
+---
+
+## 二、核心设计原则
+
+### 2.1 四条硬约束（Strict Invariants）
+
+| # | 规则 | 含义 |
+|---|------|------|
+| 1 | 只管理 agent 创建和内置的技能 | 通过 `tools/skill_usage.is_agent_created` 判断，用户手工创建的技能不受影响 |
+| 2 | 绝不自动删除，最多归档 | 归档到 `~/.hermes/skills/.archive/`，可恢复，不是真删除 |
+| 3 | 置顶（pinned）技能不被自动处理 | 用户可以 `hermes curator pin <name>` 保护重要技能 |
+| 4 | 使用 auxiliary client | 独立模型通道，不影响主会话的 prompt cache |
+
+### 2.2 触发机制
+
+**非 cron 定时任务，而是基于空闲触发（inactivity-triggered）：**
+
+```mermaid
+flowchart TD
+    A[Session Start / Housekeeping Tick] --> B{curator.enabled?}
+    B -->|No| X[跳过]
+    B -->|Yes| C{paused?}
+    C -->|Yes| X
+    C -->|No| D{距上次运行 ≥ interval_hours?}
+    D -->|No| X
+    D -->|Yes| E{idle_for_seconds ≥ min_idle_hours?}
+    E -->|No| X
+    E -->|Yes| F[执行 curator pass]
+```
+
+默认参数：
+- `interval_hours` = `24 * 7`（**7 天**）
+- `min_idle_hours` = `2`（**闲置 2 小时**，但目前 CLI 和 Gateway 都传 `float("inf")`，实际上绕过了这个检查）
+- `stale_after_days` = `30`（30 天无活动标记为 stale）
+- `archive_after_days` = `90`（90 天无活动归档）
+
+---
+
+## 三、入口方法
+
+### 3.1 公共入口：`maybe_run_curator()` — 第 1998 行
+
+```python
+def maybe_run_curator(
+    *,
+    idle_for_seconds: Optional[float] = None,
+    on_summary: Optional[Callable[[str], None]] = None,
+) -> Optional[Dict[str, Any]]:
+```
+
+**调用方（目前两个）：**
+
+| 位置 | 场景 | idle 传值 |
+|------|------|-----------|
+| `cli.py:13276` | CLI 启动时 | `float("inf")` — 启动即空闲 |
+| `gateway/run.py:20496` | Gateway housekeeping 轮询 | `float("inf")` — 永远满足 |
+
+职责：门控检查 → 调 `run_curator_review()`。失败只打 debug 日志，不抛异常。
+
+### 3.2 执行入口：`run_curator_review()` — 第 1494 行
+
+```python
+def run_curator_review(
+    on_summary: Optional[Callable[[str], None]] = None,
+    synchronous: bool = False,
+    dry_run: bool = False,
+    consolidate: Optional[bool] = None,
+) -> Dict[str, Any]:
+```
+
+被 `maybe_run_curator()` 自动调用，也被 CLI 命令 `hermes curator run` 直接调用。
+
+---
+
+## 四、执行流程
+
+### 4.1 四步流程
+
+| 步骤 | 内容 | 涉及 LLM？ |
+|------|------|------------|
+| 1 | **确定性状态转换**（`apply_automatic_transitions`） | 否 |
+| 2 | **LLM 审查**（仅在 `consolidate=True` 时） | 是，花 aux-model 的钱 |
+| 3 | **更新 `.curator_state`** | 否 |
+| 4 | **回调 `on_summary`**，通知外部 | 否 |
+
+### 4.2 第一步：确定性状态转换（第 305 行 `apply_automatic_transitions`）
+
+纯 Python 逻辑，不涉及 LLM，**不花钱**。遍历所有被管理技能，逐条比较最后活动时间：
+
+```mermaid
+flowchart TD
+    A[遍历每个技能] --> B{pinned?}
+    B -->|Yes| C[跳过]
+    B -->|No| D{cron 引用?}
+    D -->|Yes| C
+    D -->|No| E{从未使用 + 年龄 < 30天?}
+    E -->|Yes| C
+    E -->|No| F{最后活动 > 90天?}
+    F -->|Yes| G[归档 archive]
+    F -->|No| H{最后活动 > 30天 + 当前为 active?}
+    H -->|Yes| I[标记为 stale]
+    H -->|No| J{最后活动 < 30天 + 当前为 stale?}
+    J -->|Yes| K[重新激活 reactivated]
+    J -->|No| L[无变化]
+```
+
+### 4.3 第二步：LLM 审查（`_llm_pass()`，第 1583 行）
+
+**这是 curator 的真正核心**，在 `run_curator_review()` 内部定义为闭包函数 `_llm_pass()`。
+
+#### 分支逻辑：
+
+```
+consolidate = False（默认）              consolidate = True（用户显式开启）
+───────────────────────                 ────────────────────────────
+只做第一步的确定性 prune                  ↑ 第一步的 prune 照做
+跳过 LLM，不花钱                          ↓ 然后进入 LLM 流程：
+写报告 → 结束                             1. _render_candidate_list()
+                                          2. 组装 prompt（CURATOR_REVIEW_PROMPT）
+                                          3. _run_llm_review(prompt)
+                                             → spawn AIAgent fork
+                                             → LLM 调用 skill_manage/terminal
+                                          4. _classify_removed_skills()
+                                          5. _reconcile_classification()
+                                          6. _build_rename_summary()
+                                          7. _write_run_report()
+                                          8. save_state()
+                                          9. on_summary()
+```
+
+#### consolidate 参数决策链（第 1528 行）：
+
+```python
+if consolidate is None:
+    consolidate = get_consolidate()  # 读配置 curator.consolidate（默认 False）
+```
+
+| 场景 | consolidate 值 | 效果 |
+|------|---------------|------|
+| `maybe_run_curator()` 不传 | `None` → `False`（读配置） | 只 prune，不花 LLM 钱 |
+| `hermes curator run --consolidate` | `True`（强制） | 完整 LLM review |
+| 配置设 `curator.consolidate: true` | `None` → `True`（读配置） | 默认也跑 LLM |
+
+### 4.4 LLM 审查的 Prompt 策略
+
+`CURATOR_REVIEW_PROMPT`（第 417 行）是一段约 150 行的详细指令，核心思路是 **Umbrella Building**：
+
+- **目标**：把几百个窄技能（每个只记录一次 session 的特定 bug）合并成几十个**类级别**（class-level）的大技能
+- **方法**：识别前缀集群（如 `hermes-config-*`、`mcp-*`、`python-*`），每个集群创建一个 umbrella 技能，把子技能的内容吸收为其 `references/`、`templates/`、`scripts/` 子文件
+- **约束**：不删技能、不碰 pinned、不碰 hub-installed、不碰外部目录技能
+
+#### PRUNE-BUILTINS 模式（第 1658-1668 行）
+
+当用户开启 `curator.prune_builtins: true` 时，动态追加一段提示词：
+
+> "内置技能也在候选列表里了，可以像对待 agent 创建的技能一样归档它们。但只能归档不能删除，且 `hermes update` 不会自动恢复。"
+
+覆盖了主 prompt 中规则 #1 对 bundled skills 的限制。
+
+---
+
+## 五、状态管理
+
+### 5.1 技能生命周期
+
+```
+active ──(30天无活动)──▶ stale ──(90天无活动)──▶ archived
+  ▲                          │                        │
+  │                          │                        │
+  └────(有活动，自动恢复)─────┘                        │
+                                                      │
+                              可恢复 ◀── hermes curator restore <name>
+```
+
+### 5.2 `.curator_state` 文件
+
+路径：`~/.hermes/skills/.curator_state`
+
+```json
+{
+  "last_run_at": "2026-07-19T10:30:00+00:00",
+  "last_run_duration_seconds": 45.2,
+  "last_run_summary": "auto: 3 marked stale, 1 archived; llm: skipped (consolidation off)",
+  "last_run_summary_shown_at": null,
+  "last_report_path": "/Users/.../logs/curator/20260719-103000",
+  "paused": false,
+  "run_count": 12
+}
+```
+
+### 5.3 报告文件
+
+每次运行产生：`logs/curator/{YYYYMMDD-HHMMSS}/`
+- `run.json` — 机器可读的完整数据
+- `REPORT.md` — 人类可读的审查报告
+- `cron_rewrites.json` — 仅在 cron 引用被改写时产生
+
+---
+
+## 六、关键设计决策
+
+### 6.1 为什么在 LLM 之前就持久化状态？（第 1570 行注释）
+
+> "Persist state before the LLM pass so a crash mid-review still records the run and doesn't immediately re-trigger."
+
+LLM 审查可能跑很久（50-100 次 API 调用）。如果在 LLM 中途崩溃，状态文件已记录 `last_run_at`，下次检查发现距上次运行还不够 7 天，**不会立刻重新触发**，避免崩溃循环。
+
+### 6.2 dry-run 为什么不 bump 时间戳？（第 1571 行注释）
+
+> "dry run shouldn't push the next scheduled real pass out."
+
+dry-run 是试运行，只出报告不做真实变更。如果试运行也更新 `last_run_at`，真正的定时审查会被推迟整整 7 天。
+
+### 6.3 快照失败为什么阻止 curator？（第 1544 行注释）
+
+> "A failed snapshot logs at debug and continues — the alternative is that a transient disk issue silently disables curator forever, which is worse."
+
+快照（`curator_backup.snapshot_skills`）是 curator 的安全网，但不是 curator 的前置条件。一次磁盘瞬断如果导致 curator 永久静默停摆，比丢失一次回滚保险更糟。
+
+### 6.4 为什么用线程而不是 asyncio？（第 1748 行）
+
+```python
+t = threading.Thread(target=_llm_pass, daemon=True, name="curator-review")
+t.start()
+```
+
+- `AIAgent.run_conversation()` 是**同步阻塞**的，底层 HTTP 调用链全同步
+- 改造成 async 需要重构 `AIAgent` → HTTP 客户端整条链路，影响面巨大，收益小
+- curator 是低频任务（7 天一次、一次一个 LLM 审查），守护线程完全够用
+- Hermes 核心 agent 循环本身就是同步的 `while` 循环，不是为了高并发设计的
+
+实际上 Hermes 项目在**该用 async 的地方也用了 async**（Gateway 的 Discord/Slack 接入、aiohttp 代理、LSP client），只是核心 agent 不需要而已。
+
+---
+
+## 七、返回值
+
+### 7.1 `run_curator_review()` 返回值
+
+```python
+{
+    "started_at": "2026-07-19T10:30:00+00:00",   # 启动时间（ISO 8601）
+    "auto_transitions": {                          # 确定性阶段计数
+        "checked": 42,
+        "marked_stale": 3,
+        "archived": 1,
+        "reactivated": 0,
+        "seeded": 0
+    },
+    "summary_so_far": "3 marked stale, 1 archived"  # 确定性阶段摘要
+}
+```
+
+**注意**：因为默认异步（`synchronous=False`），返回时 LLM 审查还没执行完。这三个值只反映第一步（确定性 prune）。LLM 完成后的结果通过 `on_summary` 回调和状态文件传递。
+
+### 7.2 `on_summary` 回调
+
+```python
+on_summary: Optional[Callable[[str], None]] = None
+```
+
+外部传入的回调函数，curator 在关键节点调用它推送摘要消息：
+
+| 触发时机 | 消息示例 |
+|----------|----------|
+| 运行前创建了快照 | `"curator: snapshot created (pre-curator-run-xxx)"` |
+| consolidation 关闭，仅 prune | `"curator: auto: 3 marked stale; llm: skipped (consolidation off)"` |
+| LLM 审查完成 | `"curator: auto: no changes; llm: 12 consolidated, 3 pruned\narchived 15 skill(s):\n  • pdf-extraction → document-tools\n  …"` |
+
+---
+
+## 八、关键函数索引
+
+| 函数 | 行号 | 用途 |
+|------|------|------|
+| `load_state()` | 101 | 读取 `.curator_state` 文件 |
+| `save_state()` | 116 | 写入 `.curator_state` 文件 |
+| `is_enabled()` | 154 | 检查 `curator.enabled` 配置 |
+| `is_paused()` | 130 | 检查是否暂停 |
+| `get_interval_hours()` | 160 | 默认 168（7天） |
+| `get_min_idle_hours()` | 168 | 默认 2 小时 |
+| `get_stale_after_days()` | 176 | 默认 30 天 |
+| `get_archive_after_days()` | 184 | 默认 90 天 |
+| `get_consolidate()` | 204 | 默认 False |
+| `get_prune_builtins()` | 192 | 是否允许清理内置技能 |
+| `should_run_now()` | 233 | 门控：是否该运行了 |
+| `apply_automatic_transitions()` | 305 | 第一步：确定性状态转换 |
+| `run_curator_review()` | 1494 | 执行一次 curator 审查 |
+| `_llm_pass()` | 1583 | 核心：LLM 审查闭包 |
+| `_run_llm_review()` | 1825 | spawn AIAgent fork |
+| `_write_run_report()` | 1093 | 写 run.json + REPORT.md |
+| `_classify_removed_skills()` | 615 | 分析工具调用，分类归档原因 |
+| `_reconcile_classification()` | 872 | 合并 LLM 声明 + 工具调用证据 |
+| `_build_rename_summary()` | 1003 | 生成 `old → umbrella` 映射 |
+| `_parse_structured_summary()` | 737 | 解析 LLM 返回的 YAML 块 |
+| `_extract_absorbed_into_declarations()` | 818 | 从工具调用提取 `absorbed_into` 声明 |
+| `maybe_run_curator()` | 1998 | 公共入口 + 门控 |
+
+---
+
+## 九、配置参考
+
+```yaml
+# ~/.hermes/config.yaml
+curator:
+  enabled: true              # 是否启用（默认 true）
+  interval_hours: 168        # 运行间隔（默认 7 天）
+  min_idle_hours: 2          # 最小空闲时长
+  stale_after_days: 30       # 多久无活动标 stale
+  archive_after_days: 90     # 多久无活动归档
+  consolidate: false         # 是否开启 LLM umbrella-building（默认关）
+  prune_builtins: true       # 是否允许清理内置技能（默认 true）
+```
+
+CLI 命令：
+- `hermes curator status` — 查看 curator 状态和上次报告
+- `hermes curator run --dry-run` — 试运行，只看报告不执行
+- `hermes curator run --consolidate` — 强制执行含 LLM 的完整审查
+- `hermes curator pin <name>` — 置顶技能，curator 不再动它
+- `hermes curator restore <name>` — 从归档恢复技能
+- `hermes curator pause` / `hermes curator resume` — 暂停/恢复
+
+---
+
+## 十、待补充
+
+> 后续如需补充的内容可在此记录：
+>
+> - [ ] 技能归档后的恢复机制细节
+> - [ ] `skill_usage` 模块的完整 API
+> - [ ] `curator_backup` 快照机制
+> - [ ] cron 引用改写（`rewrite_skill_refs`）的完整流程
+> - [ ] 与 gateway housekeeping 的协作细节
+> - [ ] curator 端到端测试用例解读
