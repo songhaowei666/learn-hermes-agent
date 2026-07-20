@@ -1,7 +1,7 @@
 # Curator —— 后台技能维护编排器
 
 > 文件位置：`agent/curator.py`（约 2017 行）
-> 分析日期：2026-07-19
+> 分析日期：2026-07-20（更新：工具机制、模型解析、归档分类体系）
 
 ---
 
@@ -170,6 +170,154 @@ if consolidate is None:
 
 覆盖了主 prompt 中规则 #1 对 bundled skills 的限制。
 
+#### Prompt 拼接位置
+
+`CURATOR_REVIEW_PROMPT` 在 `_llm_pass()` 内被拼接到最终 prompt 中（第 1669-1676 行），有两种组装方式：
+
+| 模式 | 组装公式 | 用途 |
+|------|----------|------|
+| dry_run | `DRY_RUN_BANNER + CURATOR_REVIEW_PROMPT + builtins_note + candidate_list` | 前面插入 "只读不写" 的 banner |
+| 正式运行 | `CURATOR_REVIEW_PROMPT + builtins_note + candidate_list` | 无 banner，LLM 可执行变更 |
+
+拼接后的 prompt 作为 `user_message` 传给 `_run_llm_review()`，成为审查 LLM 收到的第一条消息。
+
+### 4.5 `_run_llm_review()` 详解 — 第 1825 行
+
+这是真正 spawn AIAgent fork 执行 LLM 审查的函数。从不抛异常，失败返回结构化错误。
+
+#### 4.5.1 模型解析：三级回退
+
+`_resolve_review_runtime()`（第 1758 行）决定 curator fork 用什么模型：
+
+```
+优先级1: auxiliary.curator.{provider,model}     ← 标准的 aux task slot，通过 hermes model 配置
+    ↓ 没配或 provider="auto"
+优先级2: curator.auxiliary.{provider,model}      ← 旧版配置路径（已废弃，打 warning）
+    ↓ 也没配
+优先级3: model.{provider,default}                ← 兜底：直接用主聊天模型
+```
+
+此外，`resolve_runtime_provider()` 还会处理凭证解析（API key、base URL、credential pool、ACP command 等），确保即使 curator 用不同 provider 也能正确认证。
+
+#### 4.5.2 AIAgent 实例化参数
+
+```python
+review_agent = AIAgent(
+    model=_model_name,
+    provider=_resolved_provider,
+    api_key=_api_key,
+    base_url=_base_url,
+    api_mode=_api_mode,
+    credential_pool=_credential_pool,
+    request_overrides=_request_overrides,
+    max_iterations=9999,          # 高上限，因为可能遍历几百个技能
+    quiet_mode=True,              # 静默，不污染前台终端
+    platform="curator",           # 标记为 curator 平台
+    skip_context_files=True,      # 不注入项目上下文
+    skip_memory=True,             # 不初始化记忆系统
+)
+```
+
+#### 4.5.3 关键后处理
+
+创建 AIAgent 后立即做三件事：
+
+```python
+review_agent._memory_nudge_interval = 0   # 禁用记忆自动 nudge
+review_agent._skill_nudge_interval = 0    # 禁用技能自动 nudge
+review_agent._memory_write_origin = "background_review"  # 标记写入来源
+```
+
+`_memory_write_origin = "background_review"` 尤为关键：`skill_manage` 的写保护会根据这个值判断是否允许修改 bundled/hub-installed 技能——curator fork 只有标了这个值，`is_background_review()` 才返回 `True`，写保护才会放行。
+
+#### 4.5.4 运行与输出重定向
+
+```python
+with open(os.devnull, "w") as _devnull, \
+     contextlib.redirect_stdout(_devnull), \
+     contextlib.redirect_stderr(_devnull):
+    conv_result = review_agent.run_conversation(user_message=prompt)
+```
+
+stdout/stderr 重定向到 `/dev/null`，防止工具调用过程中的输出污染终端。
+
+#### 4.5.5 工具调用收集
+
+审查完成后，从 `review_agent._session_messages` 中提取所有 tool call，截断超过 400 字符的参数，写入 `result_meta["tool_calls"]`，供后续分类和报告使用。
+
+### 4.6 工具传递机制：为什么 curator 没显式传 tools？
+
+`_run_llm_review()` 创建 AIAgent 时没有传 `enabled_toolsets` / `disabled_toolsets`，也没有传任何工具定义。工具从哪来？
+
+#### 自动加载机制
+
+AIAgent 初始化时（`agent/agent_init.py:1189`）：
+
+```python
+agent.tools = registry.get_tool_definitions(
+    enabled_toolsets=enabled_toolsets,   # None → 不过滤
+    disabled_toolsets=disabled_toolsets,  # None → 不过滤
+)
+```
+
+不传参数 → `None` → **加载全部已注册工具**（包括 `skill_manage`、`skills_list`、`skill_view`、`terminal`，以及 `execute_code`、`browser` 等所有其他工具）。
+
+#### 双通道设计
+
+LLM 最终收到的工具信息来自两个通道：
+
+| 通道 | 形式 | 作用 |
+|------|------|------|
+| **原生 tool schema** | API `tools=` 字段，`{"type":"function","function":{name,description,parameters}}` | 精确的工具定义（参数类型、必填项、描述） |
+| **Prompt 中的 `"Your toolset:"`** | 系统消息文本 | curator 任务特定的使用策略（怎么组合工具、传什么参数） |
+
+两者是**互补关系**：原生 schema 是"字典"（能调什么），prompt 是"战术"（在这个任务里怎么用）。例如 `skill_manage` 的 schema 描述是通用的"管理技能"，prompt 补充了"归档时记得传 `absorbed_into=<umbrella>`"——这是 curator 独有的操作规范，原生 schema 不会写。
+
+#### 软约束 vs 硬过滤
+
+curator 的 LLM 理论上能调用所有工具，但靠两层约束保持行为正确：
+
+1. **Prompt 软约束**：`"Your toolset:"` 明确列出允许使用的工具 + 具体用法
+2. **运行时禁用**：`_memory_nudge_interval = 0` / `_skill_nudge_interval = 0` 关掉自动 nudge，`skip_memory=True` 不初始化记忆后端
+
+设计思路：**工具全集加载（简单），靠 prompt 约束行为（灵活），禁掉自动干扰（安静）**。curator 是低频任务，没必要为它建一套工具白名单过滤。
+
+### 4.7 归档分类体系：三信号融合 — 第 615-1000 行
+
+curator 最精妙的设计之一：一个技能被归档了，如何判断它是"被合并到 umbrella"还是"单纯过期清理"？三种信息来源，按权威性从高到低融合。
+
+#### 三个信号源
+
+| 优先级 | 信号 | 来源 | 函数 |
+|--------|------|------|------|
+| 🔴 最高 | `absorbed_into` 声明 | LLM 调用 `skill_manage(action='delete')` 时**当场声明** `absorbed_into=<umbrella>` 或 `absorbed_into=""` | `_extract_absorbed_into_declarations()` |
+| 🟡 中等 | 结构化 YAML 块 | LLM 最终回复里 `## Structured summary` 下的 `consolidations:` / `prunings:` | `_parse_structured_summary()` |
+| 🟢 最低 | 工具调用启发式 | 纯代码分析：LLM 有没有在删除 X 的同时往 Y 写文件 / patch？ | `_classify_removed_skills()` |
+
+#### 融合策略（`_reconcile_classification()`，第 872 行）
+
+```
+对于每个被删除的技能：
+  1. 有 absorbed_into 声明？
+     ├── into="" → 明确 prune ✅
+     ├── into="Y" 且 Y 存在 → 明确 consolidation ✅
+     └── into="Y" 但 Y 不存在 → LLM 幻觉，降级 ↓
+  
+  2. LLM 的 YAML 说合并到 Y？
+     ├── Y 存在 → consolidation ✅
+     └── Y 不存在 → 幻觉，看启发式
+  
+  3. 启发式发现工具调用证据？
+     ├── 有 → consolidation（标记 source="tool-call audit"）
+     └── 无 → pruned（标记 source="no-evidence fallback"）
+```
+
+#### 为什么 `absorbed_into` 优先级最高？
+
+因为这是 LLM **在操作发生的瞬间**自己声明的意图——"我现在删除 X，它的内容被 Y 吸收了"。比事后写的 YAML 摘要更可靠，也比纯代码分析更有语义理解。
+
+如果 LLM 声明的 `absorbed_into` 目标不存在（幻觉），则降级处理——优先用启发式的发现，否则归为 pruned。
+
 ---
 
 ## 五、状态管理
@@ -300,10 +448,14 @@ on_summary: Optional[Callable[[str], None]] = None
 | `apply_automatic_transitions()` | 305 | 第一步：确定性状态转换 |
 | `run_curator_review()` | 1494 | 执行一次 curator 审查 |
 | `_llm_pass()` | 1583 | 核心：LLM 审查闭包 |
-| `_run_llm_review()` | 1825 | spawn AIAgent fork |
+| `_render_candidate_list()` | 1472 | 格式化候选技能清单 |
+| `_run_llm_review()` | 1825 | spawn AIAgent fork（模型解析 + 实例化） |
+| `_resolve_review_runtime()` | 1758 | 三级回退解析模型和凭证 |
+| `_resolve_review_model()` | 1806 | 解析 (provider, model) 元组 |
 | `_write_run_report()` | 1093 | 写 run.json + REPORT.md |
-| `_classify_removed_skills()` | 615 | 分析工具调用，分类归档原因 |
-| `_reconcile_classification()` | 872 | 合并 LLM 声明 + 工具调用证据 |
+| `_render_report_markdown()` | 1285 | 渲染人类可读的 REPORT.md |
+| `_classify_removed_skills()` | 615 | 启发式分析：工具调用中找合并证据 |
+| `_reconcile_classification()` | 872 | 三信号融合：absorbed_into + YAML + 启发式 |
 | `_build_rename_summary()` | 1003 | 生成 `old → umbrella` 映射 |
 | `_parse_structured_summary()` | 737 | 解析 LLM 返回的 YAML 块 |
 | `_extract_absorbed_into_declarations()` | 818 | 从工具调用提取 `absorbed_into` 声明 |
@@ -337,11 +489,13 @@ CLI 命令：
 
 ## 十、待补充
 
-> 后续如需补充的内容可在此记录：
+> 已覆盖：工具传递机制（4.6）、模型解析（4.5）、归档分类融合（4.7）、prompt 拼接（4.4）、AIAgent 实例化细节（4.5）
 >
-> - [ ] 技能归档后的恢复机制细节
-> - [ ] `skill_usage` 模块的完整 API
-> - [ ] `curator_backup` 快照机制
+> 后续如需补充的内容：
+>
+> - [ ] 技能归档后的恢复机制细节（`hermes curator restore`）
+> - [ ] `skill_usage` 模块的完整 API（`agent_created_report`、`archive_skill`、`set_state` 等）
+> - [ ] `curator_backup` 快照机制（`snapshot_skills` 的完整流程）
 > - [ ] cron 引用改写（`rewrite_skill_refs`）的完整流程
-> - [ ] 与 gateway housekeeping 的协作细节
-> - [ ] curator 端到端测试用例解读
+> - [ ] `_run_llm_review()` 中 `resolve_runtime_provider` 的完整凭证解析链
+> - [ ] curator 端到端测试用例解读（`tests/agent/test_curator.py`）
