@@ -6,10 +6,14 @@
 
 | 文档 | 内容 |
 |---|---|
-| [kanban-architecture.md](kanban-architecture.md) | 看板系统全景：架构分层、核心文件、代码位置 |
-| [kanban-9-tools.md](kanban-9-tools.md) | 9 个 Kanban 工具详解：Worker 自管理 / 协作 / Orchestrator |
-| [kanban-tool-registration.md](kanban-tool-registration.md) | 工具注册机制：registry → discover → toolset 三步链条 |
-| [kanban-and-agent.md](kanban-and-agent.md) | 看板与 AI Agent 的关系：Dispatcher → Worker(spawn) → AI Agent |
+| [kanban-全面解析.md](kanban-全面解析.md) | 看板系统：架构分层、9工具详解、注册机制、与Agent关系 |
+| [curator-后台技能维护编排器.md](curator-后台技能维护编排器.md) | Curator：技能自动维护、umbrella-building、归档分类融合 |
+| [background_review-后台审查机制.md](background_review-后台审查机制.md) | 后台记忆/技能审查：触发机制、fork创建、白名单拦截、缓存 |
+| [model_tools-工具调度枢纽.md](model_tools-工具调度枢纽.md) | 工具调度：get_tool_definitions、handle_function_call、类型修正 |
+| [hermes_state-SQLite会话状态存储.md](hermes_state-SQLite会话状态存储.md) | SQLite 会话存储：95个方法、FTS5搜索、WAL并发 |
+| [prompt_builder-系统提示词拼装工厂.md](prompt_builder-系统提示词拼装工厂.md) | Prompt 拼装：system prompt、技能索引、上下文文件加载 |
+| [tirith_security.md](tirith_security.md) | Tirith：命令安全扫描、退出码裁决、熔断器 |
+| [AIAgent参数记录.md](AIAgent参数记录.md) | AIAgent 50个参数分类速查 |
 
 ## 项目概述
 
