@@ -1,36 +1,64 @@
-# 学习 Hermes Agent
+# Hermes Agent - 命令解析流程文档
 
-讨论记录和知识整理，方便复习和后续对话上下文。
+本文档详细记录了 Hermes Agent CLI 的命令解析流程，包括：
+1. 命令行入口到解析器（parser）的完整链路
+2. `--toolsets` 参数从 CLI 参数到最终工具过滤的完整流转
 
-## 目录
+## 文档目录
 
 | 文档 | 内容 |
-|---|---|
-| [kanban-全面解析.md](kanban-全面解析.md) | 看板系统：架构分层、9工具详解、注册机制、与Agent关系 |
-| [curator-后台技能维护编排器.md](curator-后台技能维护编排器.md) | Curator：技能自动维护、umbrella-building、归档分类融合 |
-| [background_review-后台审查机制.md](background_review-后台审查机制.md) | 后台记忆/技能审查：触发机制、fork创建、白名单拦截、缓存 |
-| [model_tools-工具调度枢纽.md](model_tools-工具调度枢纽.md) | 工具调度：get_tool_definitions、handle_function_call、类型修正 |
-| [hermes_state-SQLite会话状态存储.md](hermes_state-SQLite会话状态存储.md) | SQLite 会话存储：95个方法、FTS5搜索、WAL并发 |
-| [prompt_builder-系统提示词拼装工厂.md](prompt_builder-系统提示词拼装工厂.md) | Prompt 拼装：system prompt、技能索引、上下文文件加载 |
-| [tirith_security.md](tirith_security.md) | Tirith：命令安全扫描、退出码裁决、熔断器 |
-| [AIAgent参数记录.md](AIAgent参数记录.md) | AIAgent 50个参数分类速查 |
+|------|------|
+| [01-命令入口到解析器.md](01-命令入口到解析器.md) | `hermes chat` 如何找到 `_parser.py`，argparse 的构建与 dispatch 机制 |
+| [02-toolsets参数流转.md](02-toolsets参数流转.md) | `--toolsets "web,terminal"` 从命令行到模型 API 的 6 步完整流转 |
 
-## 项目概述
+## 关键文件索引
 
-Hermes Agent 是 Nous Research 开发的个人 AI Agent 框架。核心概念：
+| 文件 | 作用 |
+|------|------|
+| `pyproject.toml` | 声明 `hermes` 命令入口点 → `hermes_cli.main:main` |
+| `hermes_cli/main.py` | `main()` 入口函数，组装 parser 并 dispatch |
+| `hermes_cli/_parser.py` | 顶层 parser + `chat` 子 parser 构建 |
+| `cli.py` | `HermesCLI` 类 + `cli.main()` 函数（fire.Fire 入口） |
+| `run_agent.py` | `AIAgent` 类 + `run_agent.main()` 函数（直接调用入口） |
+| `agent/agent_init.py` | `init_agent()` - 初始化 agent，存储 toolsets 并调用工具过滤 |
+| `model_tools.py` | `get_tool_definitions()` / `_compute_tool_definitions()` - 核心过滤引擎 |
+| `toolsets.py` | `resolve_toolset()` / `validate_toolset()` - 工具集定义与解析 |
+| `hermes_cli/cli_agent_setup_mixin.py` | `_init_agent()` - CLI 模式下创建 AIAgent 实例 |
+
+## 两条入口路径
 
 ```
-第 ① 层：核心 — AIAgent 对话循环（run_agent.py）
-第 ② 层：入口 — CLI / Gateway / TUI / Desktop（都调用同一核心）
-第 ③ 层：编排 — Kanban（多 Agent 看板）/ Delegate（委托）/ Cron（定时）
+                    ┌──────────────┐
+                    │  hermes CLI  │
+                    └──────┬───────┘
+                           │
+              ┌────────────┼────────────┐
+              ▼            ▼            ▼
+         hermes        hermes       hermes
+         (无参数)      chat -q      --tui
+              │            │            │
+              ▼            ▼            ▼
+         cmd_chat()   cmd_chat()   _launch_tui()
+              │            │            │
+              └────────────┼────────────┘
+                           │
+                           ▼
+                     HermesCLI()          ← cli.py
+                           │
+                           ▼
+                 _init_agent()            ← cli_agent_setup_mixin.py
+                           │
+                           ▼
+                      AIAgent()           ← run_agent.py
+                           │
+                           ▼
+                    init_agent()          ← agent/agent_init.py
+                           │
+                           ▼
+               get_tool_definitions()     ← model_tools.py
 ```
 
-## 关键入口文件
+## 版本信息
 
-| 优先级 | 文件 | 职责 |
-|---|---|---|
-| ⭐⭐⭐ | `run_agent.py` | 核心对话循环（while 循环 + API 调用 + 工具执行） |
-| ⭐⭐ | `model_tools.py` | 工具发现、注册、调用的枢纽 |
-| ⭐ | `agent/prompt_builder.py` | 系统提示词构建 |
-| ⭐⭐⭐ | `cli.py` | CLI 交互入口 |
-| ⭐⭐ | `gateway/run.py` | 消息平台 Gateway 入口 |
+- 项目：hermes-agent
+- 分析日期：2026-07-31
