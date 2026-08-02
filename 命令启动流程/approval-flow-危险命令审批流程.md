@@ -663,3 +663,200 @@ Turn N+1:
 | `/deny` 命令 | [slash_commands.py:4398](gateway/slash_commands.py#L4398) | Gateway 用户侧的拒绝触发 |
 | Agent loop 工具分发 | [model_tools.py:1025](model_tools.py#L1025) | `handle_function_call` → registry.dispatch |
 | Agent 执行入口 | [run_agent.py:5673](run_agent.py#L5673) | `_execute_tool_calls` |
+
+---
+
+## 九、补充概念：并发模型与架构设计
+
+### 9.1 Session 与 Agent 线程的关系
+
+**一个 session ≠ 一个线程。** 真实关系是：一个 session 包含多个 agent 线程，session_key 通过 `contextvars` 在线程间传播。
+
+```
+Gateway 进程
+  └─ ThreadPoolExecutor (max_workers=10)
+       │
+       ├─ thread "hermes-gateway-0"  ← session_A 主 turn
+       │    _approval_session_key.set("session_A")   ← contextvar
+       │    agent.run_conversation()
+       │
+       ├─ thread "hermes-gateway-1"  ← session_B 主 turn
+       │    _approval_session_key.set("session_B")
+       │
+       ├─ thread "hermes-gateway-2"  ← session_A 并行工具调用
+       │    copy_context() 继承 → _approval_session_key.get() = "session_A"
+       │    执行 terminal() → check_all_command_guards() 拿到 key="session_A"
+       │
+       └─ thread "hermes-gateway-3"  ← session_A execute_code RPC
+            _approval_session_key.get() = "session_A"
+```
+
+**设置（一次 turn 开始时）**:
+
+```python
+# gateway/run.py:19042-19043
+_approval_session_key = session_key or ""
+_approval_session_token = set_current_session_key(_approval_session_key)
+```
+
+**传播（到工作线程）**:
+
+```python
+# gateway/run.py:15100-15108
+async def _run_in_executor_with_context(self, func, *args):
+    ctx = copy_context()              # 快照主线程全部 contextvar
+    return await loop.run_in_executor(
+        self._get_executor(),
+        ctx.run, func, *args,         # 在新线程以 ctx 为上下文运行
+    )
+```
+
+**为什么不用 `os.environ`？** 环境变量是进程级全局的，并发 session 会互相覆盖：
+
+```python
+# gateway/run.py:18162 — 注释警告:
+# We deliberately do NOT write os.environ["HERMES_SESSION_KEY"] here:
+# os.environ is process-global, so concurrent gateway sessions
+# would clobber each other's value → 审批消息发错人
+```
+
+### 9.2 模块级 dict 的共享模型
+
+```python
+# approval.py:1477-1481, 1506-1507
+_lock = threading.Lock()                    # 线程间互斥锁
+_gateway_queues: dict[str, list] = {}       # 进程级全局共享
+_gateway_notify_cbs: dict[str, object] = {} # 进程级全局共享
+_pending: dict[str, dict] = {}              # 进程级全局共享
+_session_approved: dict[str, set] = {}      # 进程级全局共享
+_session_yolo: set[str] = set()             # 进程级全局共享
+_permanent_approved: set = set()            # 进程级全局共享
+```
+
+Python 模块级变量在进程内是**单例**。无论多少个线程，`import tools.approval` 拿到的都是同一个 dict。
+
+**隔离靠 `session_key` 做 dict key，而不是线程**:
+
+```
+_gateway_queues = {
+    "session_A": [entry_A1, entry_A2],   ← 线程-2 和线程-5 并发写入
+    "session_B": [entry_B1],             ← 线程-3 写入
+}
+```
+
+**锁保护的是 dict 内部结构不被并发写坏**，不做访问隔离:
+
+```
+4 种线程同时操作这些 dict:
+  Agent 执行线程:   _gateway_queues["s_A"].append(entry)     with _lock
+  Agent 执行线程:   approve_session("s_B", key)               with _lock
+  用户消息线程:     resolve_gateway_approval("s_A", "once")    with _lock
+  用户消息线程:     register_gateway_notify("s_C", cb)         with _lock
+```
+
+为什么不用 `threading.local()`？因为这里有**跨线程通信**的硬需求——线程-A 写入 `_gateway_queues`，线程-B 要通过 `resolve_gateway_approval` 读取并唤醒它。
+
+**隔离层次总结**:
+
+| 机制 | 作用域 | 用途 |
+|---|---|---|
+| `contextvars` | 线程/协程局部 | 隔离身份（当前线程属于哪个 session） |
+| `threading.Lock` | 跨线程互斥 | 保护共享 dict 内部结构 |
+| `session_key` 做 dict key | 逻辑隔离 | 不同 session 的数据互不干扰 |
+| 模块级 dict | 进程级单例 | 跨线程通信的桥梁 |
+
+### 9.3 Agent 线程与 Gateway 的关系
+
+Agent 线程**不是** Gateway 的变量。Gateway 持有线程池的引用，Agent 线程是池中的临时工作者。
+
+```
+GatewayRunner 实例
+  ├─ _executor: ThreadPoolExecutor ← Gateway 拥有的线程池
+  │   ├─ thread "hermes-gateway-0" ← 借用给 session_A 跑 turn
+  │   ├─ thread "hermes-gateway-1" ← 借用给 session_B 跑 turn
+  │   └─ ...                      ← 跑完归还池，不销毁
+  │
+  ├─ _session_agents: dict        ← AIAgent 实例缓存（跨 turn 复用）
+  └─ ...其他服务组件
+```
+
+```python
+# gateway/run.py:15111-15128
+def _get_executor(self):
+    executor = getattr(self, "_executor", None)
+    if executor is None:
+        executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="hermes-gateway")
+        self._executor = executor   # ← Gateway 持有池，不持有具体线程
+    return executor
+```
+
+### 9.4 force=True 重放与合并审批
+
+`force` 是 `terminal()` 的内部参数（不暴露给 LLM）。用户审批通过后，gateway 用 `force=True` 帮 LLM 重放命令，跳过全部审批检查。
+
+**为什么必须合并 tirith + dangerous 为一次审批？** 如果分开检查、分别弹审批：
+
+```
+Turn 1: tirith 发现 → 弹审批 (用户只看到 tirith 警告)
+        → 用户点 o → force=True 重放
+        → dangerous pattern 检查也被 force 跳过了!
+        → 用户没看到 dangerous 警告，命令静默执行
+```
+
+合并后一次展示全部警告，用户对所有风险知情后再审批。
+
+### 9.5 容器隔离判断
+
+Docker 容器内的命令默认跳过审批（删的是容器自己的 /），**除非**绑定了宿主机路径：
+
+```python
+# approval.py:2318-2329
+def _should_skip_container_guards(env_type, has_host_access=False):
+    if env_type == "docker":
+        return not has_host_access    # 有宿主访问 → 正常审批
+    return env_type in ("singularity", "modal", "daytona")  # 始终跳过
+```
+
+判断是否绑定宿主路径（`terminal_tool.py:260-278`）：volume spec 以 `/`、`~`、`./`、`../` 或 `C:\...` 开头即认为绑定宿主。
+
+**本质**：不是判断"命令是否危险"，而是判断"危险的定义是否适用"——没有宿主访问能力时，`rm -rf /` 和 `rm -rf /tmp/test` 后果一样：只影响用完即丢的沙箱。
+
+### 9.6 三道无条件封锁（yolo 之前）
+
+`check_all_command_guards` 中，以下三个检查在 yolo 之前执行，yolo 无法绕过:
+
+| 序号 | 检查 | 目的 | 代码位置 |
+|---|---|---|---|
+| Layer 1 | `detect_hardline_command()` | 开发者防御：rm -rf /、mkfs、shutdown 等 | [approval.py:500](tools/approval.py#L500) |
+| Layer 2 | `_check_sudo_stdin_guard()` | 防 LLM 密码爆破：`echo "guess" \| sudo -S` | [approval.py:481](tools/approval.py#L481) |
+| Layer 3 | `_match_user_deny_rule()` | 用户自定义：`approvals.deny` glob 列表 | [approval.py:514](tools/approval.py#L514) |
+
+**设计原则**: `--yolo` 是"我相信 agent"，不是"我不在乎自己亲手写的禁令"。
+
+Sudo 守卫的特殊之处：配置了 `SUDO_PASSWORD` 的用户自然会放行（_transform_sudo_command 会合法注入 -S），没配置却出现 `sudo -S` 的唯一解释是 LLM 在猜密码——这是暴力破解攻击，无条件拦截。
+
+### 9.7 YOLO 三种来源与冻结
+
+| 来源 | 设置方式 | 作用域 | 是否冻结 |
+|---|---|---|---|
+| `_YOLO_MODE_FROZEN` | `--yolo` 或 `HERMES_YOLO_MODE=1` | 整个进程 | **是** — import 时快照，运行时改 env 无效 |
+| `is_current_session_yolo_enabled()` | 网关 `/yolo` 命令 | 单个 session | 否 — `/yolo` 切换 |
+| `approval_mode == "off"` | `config.yaml` 持久配置 | 全局 | 否 — 改 config 即生效 |
+
+**冻结原因**：避免 prompt injection 攻击——如果每次读 `os.environ`，恶意 skill 在运行时设置 `os.environ["HERMES_YOLO_MODE"] = "1"` 就能关掉所有审批。
+
+### 9.8 永久允许列表的两种粒度
+
+**pattern_key 级** (用户 Phase 3 选 `[a]lways`):
+```
+"recursive delete" → 所有 rm -rf 都放行    ← 太宽泛
+```
+
+**command_allowlist 级** (config.yaml 手工配置):
+```yaml
+command_allowlist:
+  - "rm -rf /tmp/cache"       # 精确匹配这条命令
+  - "podman compose down"     # 精确匹配
+  - "podman *"                # fnmatch glob
+```
+含 shell 运算符的复杂命令不会匹配 allowlist（`_has_allowlist_shell_operator`），防止白名单过宽。
