@@ -88,7 +88,109 @@
 
 ---
 
-## 五、技能系统：索引 vs 完整内容
+## 五、两层缓存机制（深入）
+
+`build_skills_system_prompt()` 使用两层缓存，**粒度不同**：
+
+```
+build_skills_system_prompt() 被调用
+        │
+        ▼
+┌──────────────────────────────────────────────┐
+│ Layer 1: 内存 LRU (OrderedDict, 最多 8 槽)    │
+│ 键: (skills_dir, external_dirs, tools,       │
+│      toolsets, platform_hint, disabled,      │
+│      compact_categories)                     │
+│ 值: 渲染好的完整 prompt 字符串                │
+│                                              │
+│ ✅ 命中 → move_to_end() 晋升 → 直接返回       │
+│ ❌ 未命中 → 进入 Layer 2                       │
+└──────────────────────────────────────────────┘
+        │ (miss)
+        ▼
+┌──────────────────────────────────────────────┐
+│ Layer 2: 磁盘快照                              │
+│ 文件: ~/.hermes/.skills_prompt_snapshot.json  │
+│ 内容: { version, manifest, skills[],          │
+│         category_descriptions }               │
+│                                              │
+│ manifest = 每个 SKILL.md/DESCRIPTION.md 的    │
+│            [st_mtime_ns, st_size] → 变了就失效 │
+│                                              │
+│ ✅ manifest 匹配 → 用预解析 metadata 组装      │
+│ ❌ 不匹配/不存在 → 冷路径（全量文件扫描）       │
+└──────────────────────────────────────────────┘
+        │ (miss)
+        ▼
+   遍历所有 SKILL.md → parse_frontmatter()
+   → 写磁盘快照 → 写 LRU → 返回
+```
+
+### 两层存的内容不同
+
+| 层 | 存的内容 | 粒度 |
+|---|---|---|
+| Layer 1 (LRU) | 渲染完成的 prompt 文本 | 按调用参数分槽 |
+| Layer 2 (快照) | 预解析的 metadata（skill_name, category, description, platforms, conditions） | 只管文件是否变化 |
+
+### LRU 晋升机制
+
+```python
+_SKILLS_PROMPT_CACHE.move_to_end(cache_key)   # 命中时推到末尾（最新）
+_SKILLS_PROMPT_CACHE.popitem(last=False)      # 淘汰时弹出开头（最老）
+```
+
+`move_to_end` 是 OrderedDict 的方法，作用是把 key 移到最末尾作为"最新使用"。没有这一步，缓存就退化为 FIFO（先进先出），意味着常用条目也会被优先淘汰。加上后实现真正的 LRU 语义：最近用过的不会被 `popitem(last=False)` 弹出。
+
+### cache_key 的组成
+
+```python
+cache_key = (
+    str(skills_dir),                              # ~/.hermes/skills/
+    tuple(str(d) for d in external_dirs),          # config.yaml 配置的外部目录
+    tuple(sorted(str(t) for t in available_tools)),
+    tuple(sorted(str(ts) for ts in available_toolsets)),
+    _platform_hint,                                # "telegram" / "cli" / "" 等
+    tuple(sorted(disabled)),                       # 当前平台禁用的技能名
+    tuple(sorted(compact_categories or ())),       # 编码模式下折叠的类别
+)
+```
+
+`_platform_hint` 来自环境变量 `HERMES_PLATFORM` 或 `HERMES_SESSION_PLATFORM`，约 22 个值：`whatsapp`, `telegram`, `discord`, `slack`, `cli`, `tui`, `cron`, `webui`, `desktop`, `wecom`, `weixin`, `qqbot`, `yuanbao` 等。gateway 服务多个平台时，不同平台的 disabled 技能列表不同，必须按平台分槽。
+
+### 快照的目的：冷启动优化，并非 Prompt Cache
+
+快照是为了**进程重启后**不用重新 `os.walk` + `parse_frontmatter` 所有 SKILL.md，省的是文件 IO + YAML 解析的 CPU 时间。LLM 层面的 prompt caching（如 Anthropic prefix caching）是另一层，发生在服务端。
+
+### 外部技能目录：无快照
+
+外部目录（`config.yaml` → `skills.external_dirs`）**没有** Layer 2 磁盘快照。注释明确说：
+> Scan external dirs directly (no snapshot caching — they're read-only and typically small)
+
+但外部目录的结果**会**写入 Layer 1 LRU，所以进程内第二次调用仍可命中。
+
+```
+              ┌────────────┬────────────┬──────────┐
+              │ Layer 1 LRU │ Layer 2 快照 │ 冷扫描   │
+├─────────────┼────────────┼────────────┼──────────┤
+│ 本地 skills  │     ✅      │     ✅      │ 两层miss  │
+│ 外部 skills  │     ✅      │     ❌      │ 每次必走  │
+└─────────────┴────────────┴────────────┴──────────┘
+```
+
+### frontmatter_name vs skill_name
+
+`_build_snapshot_entry` 返回的 entry 包含两个名字字段：
+
+| 字段 | 来源 | 示例 |
+|---|---|---|
+| `skill_name` | SKILL.md 的**父目录名** | `skills/code-review/SKILL.md` → `"code-review"` |
+| `frontmatter_name` | YAML frontmatter 中的 `name:` 字段，未设置时 fallback 到 `skill_name` | `name: Code Review` → `"Code Review"` |
+
+外部目录去重和 disabled 判断都使用 `frontmatter_name`，因为技能索引里展示给模型看的就是这个名字。
+
+---
+## 七、技能系统：索引 vs 完整内容
 
 这个概念容易混淆，单独说明：
 
@@ -123,7 +225,7 @@
 
 ---
 
-## 六、上下文文件优先级链
+## 八、上下文文件优先级链
 
 `build_context_files_prompt()` 按以下优先级加载项目上下文，**第一个匹配到的生效**（互斥，不合并）：
 
@@ -138,7 +240,7 @@ SOUL.md（`~/.hermes/SOUL.md`）是独立的，不受此优先级影响，总是
 
 ---
 
-## 七、阅读建议
+## 九、阅读建议
 
 如果第一次读这个文件：
 

@@ -1,0 +1,6 @@
+Agent 的 system prompt 怎么拼装的 — 这是 Agent 行为的"灵魂"
+Tool/Skill 的定义和注册机制 — Agent 怎么"知道"自己有什么能力
+上下文窗口管理 — 对话长了怎么压缩、怎么召回记忆
+审批门（approval gate） — 危险操作怎么拦截
+子 Agent 调用 — 怎么把大任务拆给多个 Agent
+MCP 协议 — 怎么接入外部工具和数据源
