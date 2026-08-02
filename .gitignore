@@ -16,3 +16,5 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+
+hermes-agent-main/
